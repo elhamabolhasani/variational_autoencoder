@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import torchvision
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
 from torchvision.datasets import MNIST, FashionMNIST, CIFAR10, STL10
@@ -10,10 +9,7 @@ import os
 import pickle
 import zipfile
 import datetime
-
-import google.colab
-import googleapiclient.discovery
-import googleapiclient.http
+from shutil import copy
 
 
 class EncoderModule(nn.Module):
@@ -25,6 +21,7 @@ class EncoderModule(nn.Module):
 
     def forward(self, x):
         return self.relu(self.bn(self.conv(x)))
+
 
 class Encoder(nn.Module):
     def __init__(self, color_channels, pooling_kernels, n_neurons_in_middle_layer):
@@ -107,7 +104,7 @@ class VAE(nn.Module):
         # Middle
         self.fc1 = nn.Linear(n_neurons_middle_layer, self.n_latent_features)
         self.fc2 = nn.Linear(n_neurons_middle_layer, self.n_latent_features)
-        self.fc3 = nn.Linear(self.n_latent_features, n_neurons_middle_layer)
+        self.fc4 = nn.Linear(self.n_latent_features, n_neurons_middle_layer)
         # Decoder
         self.decoder = Decoder(color_channels, pooling_kernel, encoder_output_size)
 
@@ -117,7 +114,7 @@ class VAE(nn.Module):
         self.history = {"loss": [], "val_loss": []}
 
         # model name
-        self.model_name = dataset
+        self.model_name = dataset + '_vae'
         if not os.path.exists(self.model_name):
             os.mkdir(self.model_name)
 
@@ -135,7 +132,7 @@ class VAE(nn.Module):
     def sampling(self):
         # assume latent features space ~ N(0, 1)
         z = torch.randn(64, self.n_latent_features).to(self.device)
-        z = self.fc3(z)
+        z = self.fc4(z)
         # decode
         return self.decoder(z)
 
@@ -145,7 +142,7 @@ class VAE(nn.Module):
         # Bottle-neck
         z, mu, logvar = self._bottleneck(h)
         # decoder
-        z = self.fc3(z)
+        z = self.fc4(z)
         d = self.decoder(z)
         return d, mu, logvar
 
@@ -154,17 +151,23 @@ class VAE(nn.Module):
         data_transform = transforms.Compose([
             transforms.ToTensor()
         ])
+
         if dataset == "mnist":
-            train = MNIST(root="./data", train=True, transform=data_transform, download=True)
-            test = MNIST(root="./data", train=False, transform=data_transform, download=True)
+            train = MNIST(root="./data", train=True, transform=data_transform, download=False)
+            test = MNIST(root="./data", train=False, transform=data_transform, download=False)
         elif dataset == "fashion-mnist":
-            train = FashionMNIST(root="./data", train=True, transform=data_transform, download=True)
-            test = FashionMNIST(root="./data", train=False, transform=data_transform, download=True)
+            train = FashionMNIST(root="./data", train=True, transform=data_transform,
+                                 download=True)
+            test = FashionMNIST(root="./data", train=False, transform=data_transform,
+                                download=True)
         elif dataset == "cifar":
-            train = CIFAR10(root="./data", train=True, transform=data_transform, download=True)
-            test = CIFAR10(root="./data", train=False, transform=data_transform, download=True)
+            train = CIFAR10(root="./data", train=True, transform=data_transform,
+                            download=False)
+            test = CIFAR10(root="./data", train=False, transform=data_transform,
+                           download=False)
         elif dataset == "stl":
-            train = STL10(root="./data", split="unlabeled", transform=data_transform, download=True)
+            train = STL10(root="./data", split="unlabeled", transform=data_transform,
+                          download=True)
             test = STL10(root="./data", split="test", transform=data_transform, download=True)
 
         train_loader = torch.utils.data.DataLoader(train, batch_size=128, shuffle=True, num_workers=0)
@@ -177,7 +180,9 @@ class VAE(nn.Module):
         # https://arxiv.org/abs/1312.6114 (Appendix B)
         BCE = F.binary_cross_entropy(recon_x, x, size_average=False)
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-
+        # print("BCE : ", BCE)
+        # print("KLD : ", KLD)
+        # print("BCE + KLD : ", BCE + KLD)
         return BCE + KLD
 
     def init_model(self):
@@ -187,6 +192,7 @@ class VAE(nn.Module):
             self = self.cuda()
             torch.backends.cudnn.benchmark = True
         self.to(self.device)
+        print('device : ', self.device)
 
     # Train
     def fit_train(self, epoch):
@@ -200,6 +206,7 @@ class VAE(nn.Module):
             recon_batch, mu, logvar = self(inputs)
 
             loss = self.loss_function(recon_batch, inputs, mu, logvar)
+            # print("loss item :", loss.item())
             loss.backward()
             self.optimizer.step()
 
@@ -232,46 +239,61 @@ class VAE(nn.Module):
         save_image(self.sampling(), f"{self.model_name}/sampling_epoch_{str(epoch)}.png", nrow=8)
 
     # save results
-    def save_history(self):
-        with open(f"{self.model_name}/{self.model_name}_history.dat", "wb") as fp:
+    def save_history(self, i):
+        with open(f"{self.model_name}/{self.model_name}_history_{i}_.dat", "wb") as fp:
             pickle.dump(self.history, fp)
 
-    def save_to_zip(self):
-        with zipfile.ZipFile(f"{self.model_name}.zip", "w") as zip:
+    def save_to_zip(self, i):
+        with zipfile.ZipFile(f"{self.model_name}_{i}_.zip", "w") as zip:
             for file in os.listdir(self.model_name):
                 zip.write(f"{self.model_name}/{file}", file)
 
-    def save_to_googledrive(self, drive_service):
-        saving_filename = self.model_name + ".zip"
 
-        file_metadata = {
-            'name': saving_filename,
-            'mimeType': 'application/octet-stream'
-        }
-        media = googleapiclient.http.MediaFileUpload(saving_filename,
-                                                     mimetype='application/octet-stream',
-                                                     resumable=True)
-        created = drive_service.files().create(body=file_metadata,
-                                               media_body=media,
-                                               fields='id').execute()
-
-
-def google_drive_init():
-    google.colab.auth.authenticate_user()
-    return googleapiclient.discovery.build('drive', 'v3')
-
-
-def main():
-    googleclient = google_drive_init()
-    net = VAE("mnist")
+train_phase = True
+dataset_name = 'cifar'
+model_path = 'checkpoints/vae_normal_latent_mnist_model_0201.pt'
+optim_path = 'checkpoints/vae_normal_latent_mnist_optim_0201.pt'
+if train_phase:
+    net = VAE(dataset_name)
     net.init_model()
-    for i in range(1):
+    for i in range(0, 100):
         net.fit_train(i)
         net.test(i)
-    net.save_history()
-    net.save_to_zip()
-    net.save_to_googledrive(googleclient)
+
+        if i % 100 == 0 and i != 0:
+            torch.save(
+                net.state_dict(),
+                "./checkpoints/vae_normal_latent_" + dataset_name + f"_model_{str(i + 1).zfill(4)}.pt"
+            )
+            torch.save(
+                net.optimizer.state_dict(),
+                "./checkpoints/vae_normal_latent_" + dataset_name + f"_optim_{str(i + 1).zfill(4)}.pt"
+            )
+            net.save_history(i + 1)
+            net.save_to_zip(i + 1)
+
+else:
+    net = VAE(dataset_name)
+    net.init_model()
+    net.load_state_dict(torch.load(model_path))
+    net.optimizer.load_state_dict(torch.load(optim_path))
+    net.eval()
+
+""" sampling part """
 
 
-if __name__ == "__main__":
-    main()
+# def generate_sample():
+#     z = torch.randn(1, net.n_latent_features).to(net.device)
+#     z = net.fc4(z)
+#     # decode
+#     return net.decoder(z)
+#
+#
+# directory = dataset_name + "_vae_generated_sample"
+# if not os.path.exists(directory):
+#     os.makedirs(directory)
+#
+# for i in range(0, 10000):
+#     save_image(generate_sample(),
+#                dataset_name + "_vae_generated_sample/generared_image_" + str(i) + ".png", nrow=1)
+
