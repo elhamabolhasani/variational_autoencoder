@@ -2,10 +2,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import torchvision
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
 from torchvision.datasets import MNIST, FashionMNIST, CIFAR10, STL10
+from torch.distributions.lowrank_multivariate_normal import LowRankMultivariateNormal
 import os
+import numpy as np
 import pickle
 import zipfile
 import datetime
@@ -17,7 +20,7 @@ class EncoderModule(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(input_channels, output_channels, kernel_size=kernel, padding=pad, stride=stride)
         self.bn = nn.BatchNorm2d(output_channels)
-        self.relu = nn.ReLU(inplace=True)
+        self.relu = nn.ReLU(inplace=False)
 
     def forward(self, x):
         return self.relu(self.bn(self.conv(x)))
@@ -43,7 +46,7 @@ class DecoderModule(nn.Module):
         self.convt = nn.ConvTranspose2d(input_channels, output_channels, kernel_size=stride, stride=stride)
         self.bn = nn.BatchNorm2d(output_channels)
         if activation == "relu":
-            self.activation = nn.ReLU(inplace=True)
+            self.activation = nn.ReLU(inplace=False)  # set it true or false ??
         elif activation == "sigmoid":
             self.activation = nn.Sigmoid()
 
@@ -104,6 +107,7 @@ class VAE(nn.Module):
         # Middle
         self.fc1 = nn.Linear(n_neurons_middle_layer, self.n_latent_features)
         self.fc2 = nn.Linear(n_neurons_middle_layer, self.n_latent_features)
+        self.fc3 = nn.Linear(n_neurons_middle_layer, self.n_latent_features)
         self.fc4 = nn.Linear(self.n_latent_features, n_neurons_middle_layer)
         # Decoder
         self.decoder = Decoder(color_channels, pooling_kernel, encoder_output_size)
@@ -114,20 +118,45 @@ class VAE(nn.Module):
         self.history = {"loss": [], "val_loss": []}
 
         # model name
-        self.model_name = dataset + '_vae'
+        self.model_name = dataset + '_low_vae'
         if not os.path.exists(self.model_name):
             os.mkdir(self.model_name)
 
-    def _reparameterize(self, mu, logvar):
-        std = logvar.mul(0.5).exp_()
+    def _reparameterize(self, mu, logvar, u):
+        # sample from normal
         esp = torch.randn(*mu.size()).to(self.device)
-        z = mu + std * esp
-        return z
+
+        # std = logvar.exp_()
+        std = torch.exp(logvar)
+        u = u.view(-1, self.n_latent_features, 1)
+        ut = u.view(-1, 1, self.n_latent_features)
+
+        # make cov matirx
+        std_mat = torch.diag_embed(std)
+        ut_u = torch.matmul(u, ut)
+
+        cov = std_mat + ut_u
+        # change mean shape
+        mu = mu.view(-1, self.n_latent_features, 1)
+
+        # Set covariance function.
+        K_0 = cov
+        epsilon = 0.0001
+
+        # Add small pertturbation.
+        K = K_0 + torch.tensor(epsilon * np.identity(self.n_latent_features)).to(self.device)
+
+        #  Cholesky decomposition.
+        L = torch.linalg.cholesky(K)
+        LL = torch.matmul(L, L.transpose(2, 1))
+
+        z = mu + torch.matmul(L.float(), esp.view(-1, self.n_latent_features, 1))
+        return z.view(-1, self.n_latent_features)
 
     def _bottleneck(self, h):
-        mu, logvar = self.fc1(h), self.fc2(h)
-        z = self._reparameterize(mu, logvar)
-        return z, mu, logvar
+        mu, logvar, u = self.fc1(h), self.fc2(h), self.fc3(h)
+        z = self._reparameterize(mu, logvar, u)
+        return z, mu, logvar, u
 
     def sampling(self):
         # assume latent features space ~ N(0, 1)
@@ -140,21 +169,22 @@ class VAE(nn.Module):
         # Encoder
         h = self.encoder(x)
         # Bottle-neck
-        z, mu, logvar = self._bottleneck(h)
+        z, mu, logvar, u = self._bottleneck(h)
         # decoder
-        z = self.fc4(z)
-        d = self.decoder(z)
-        return d, mu, logvar
+        z1 = self.fc4(z)
+        d = self.decoder(z1)
+        return d, mu, logvar, u
 
     # Data
     def load_data(self, dataset):
         data_transform = transforms.Compose([
             transforms.ToTensor()
         ])
-
         if dataset == "mnist":
-            train = MNIST(root="./data", train=True, transform=data_transform, download=False)
-            test = MNIST(root="./data", train=False, transform=data_transform, download=False)
+            train = MNIST(root="./data", train=True, transform=data_transform,
+                          download=False)
+            test = MNIST(root="./data", train=False, transform=data_transform,
+                         download=False)
         elif dataset == "fashion-mnist":
             train = FashionMNIST(root="./data", train=True, transform=data_transform,
                                  download=True)
@@ -168,21 +198,31 @@ class VAE(nn.Module):
         elif dataset == "stl":
             train = STL10(root="./data", split="unlabeled", transform=data_transform,
                           download=True)
-            test = STL10(root="./data", split="test", transform=data_transform, download=True)
+            test = STL10(root="./data", split="test", transform=data_transform,
+                         download=True)
 
         train_loader = torch.utils.data.DataLoader(train, batch_size=128, shuffle=True, num_workers=0)
         test_loader = torch.utils.data.DataLoader(test, batch_size=64, shuffle=True, num_workers=0)
 
         return train_loader, test_loader
 
-    # Model
-    def loss_function(self, recon_x, x, mu, logvar):
-        # https://arxiv.org/abs/1312.6114 (Appendix B)
+    def loss_function(self, recon_x, x, mu, logvar, u):
+        uu = u.pow(2)  # tr{uut}
+        # recounstruction error
         BCE = F.binary_cross_entropy(recon_x, x, size_average=False)
-        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        # print("BCE : ", BCE)
-        # print("KLD : ", KLD)
-        # print("BCE + KLD : ", BCE + KLD)
+        u = u.view(-1, self.n_latent_features, 1)
+        ut = u.view(-1, 1, self.n_latent_features)
+        std = torch.exp(logvar)  # .exp_()
+
+        # log (|(1 + ut_std_inv_u)|)
+        std_inv = 1 / std
+        std_inv_mat = torch.diag_embed(std_inv)
+        ut_std_inv = torch.matmul(ut, std_inv_mat)
+        ut_std_inv_u = torch.matmul(ut_std_inv, u)
+        det_cov = torch.log(torch.abs(1 + ut_std_inv_u))  # size(128, 1, 1)
+        # + u.pow(2)+ log (|(1 + ut_std_inv_u)|)
+        # logvar = log(|det(std_mat)|)
+        KLD = -0.5 * (torch.sum(1 + logvar - mu.pow(2) - uu - logvar.exp()) + det_cov.sum())
         return BCE + KLD
 
     def init_model(self):
@@ -192,7 +232,6 @@ class VAE(nn.Module):
             self = self.cuda()
             torch.backends.cudnn.benchmark = True
         self.to(self.device)
-        print('device : ', self.device)
 
     # Train
     def fit_train(self, epoch):
@@ -203,10 +242,10 @@ class VAE(nn.Module):
         for batch_idx, (inputs, _) in enumerate(self.train_loader):
             inputs = inputs.to(self.device)
             self.optimizer.zero_grad()
-            recon_batch, mu, logvar = self(inputs)
+            recon_batch, mu, logvar, u = self(inputs)
 
-            loss = self.loss_function(recon_batch, inputs, mu, logvar)
-            # print("loss item :", loss.item())
+            loss = self.loss_function(recon_batch, inputs, mu, logvar, u)
+            # loss.backward(retain_graph=True)
             loss.backward()
             self.optimizer.step()
 
@@ -225,8 +264,8 @@ class VAE(nn.Module):
         with torch.no_grad():
             for batch_idx, (inputs, _) in enumerate(self.test_loader):
                 inputs = inputs.to(self.device)
-                recon_batch, mu, logvar = self(inputs)
-                val_loss += self.loss_function(recon_batch, inputs, mu, logvar).item()
+                recon_batch, mu, logvar, u = self(inputs)
+                val_loss += self.loss_function(recon_batch, inputs, mu, logvar, u).item()
                 samples_cnt += inputs.size(0)
 
                 if batch_idx == 0:
@@ -250,24 +289,24 @@ class VAE(nn.Module):
 
 
 train_phase = True
-dataset_name = 'cifar'
-model_path = 'checkpoints/vae_normal_latent_mnist_model_0201.pt'
-optim_path = 'checkpoints/vae_normal_latent_mnist_optim_0201.pt'
+dataset_name = 'mnist'
+model_path = 'checkpoints/low_vae_normal_latent_mnist_model_0201.pt'
+optim_path = 'checkpoints/low_vae_normal_latent_mnist_optim_0201.pt'
 if train_phase:
     net = VAE(dataset_name)
     net.init_model()
-    for i in range(0, 100):
+    for i in range(0, 500):
         net.fit_train(i)
         net.test(i)
 
-        if i % 100 == 0 and i != 0:
+        if i % 10 == 0 and i != 0:
             torch.save(
                 net.state_dict(),
-                "./checkpoints/vae_normal_latent_" + dataset_name + f"_model_{str(i + 1).zfill(4)}.pt"
+                "./checkpoints/low_vae_normal_latent_" + dataset_name + f"_model_{str(i + 1).zfill(4)}.pt"
             )
             torch.save(
                 net.optimizer.state_dict(),
-                "./checkpoints/vae_normal_latent_" + dataset_name + f"_optim_{str(i + 1).zfill(4)}.pt"
+                "./checkpoints/low_vae_normal_latent_" + dataset_name + f"_optim_{str(i + 1).zfill(4)}.pt"
             )
             net.save_history(i + 1)
             net.save_to_zip(i + 1)
@@ -282,18 +321,17 @@ else:
 """ sampling part """
 
 
-# def generate_sample():
-#     z = torch.randn(1, net.n_latent_features).to(net.device)
-#     z = net.fc4(z)
-#     # decode
-#     return net.decoder(z)
-#
-#
-# directory = dataset_name + "_vae_generated_sample"
-# if not os.path.exists(directory):
-#     os.makedirs(directory)
-#
-# for i in range(0, 10000):
-#     save_image(generate_sample(),
-#                dataset_name + "_vae_generated_sample/generared_image_" + str(i) + ".png", nrow=1)
+def generate_sample():
+    z = torch.randn(1, net.n_latent_features).to(net.device)
+    z = net.fc4(z)
+    # decode
+    return net.decoder(z)
 
+
+directory = dataset_name + "_low_vae_generated_sample"
+if not os.path.exists(directory):
+    os.makedirs(directory)
+
+for i in range(0, 10000):
+    save_image(generate_sample(),
+               dataset_name + "_low_vae_generated_sample/generared_image_" + str(i) + ".png", nrow=1)
